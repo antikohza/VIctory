@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -38,15 +40,20 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
+mod scissor;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

@@ -72,10 +72,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
-        if !guarded {
-            return None;
+        let mut lost = Vec::new();
+        let again = by_allocation(first * PAGE, last * PAGE, &mut j.found, &mut lost);
+        if !lost.is_empty() {
+            j.asked += 1;
+            let now = j.asked;
+            for page in lost {
+                j.written.insert(page, now);
+            }
         }
-        guard(first * PAGE, last * PAGE)?
+        match again {
+            Some(pages) => pages,
+            None if !guarded => return None,
+            None => guard(first * PAGE, last * PAGE)?,
+        }
     } else {
         Vec::new()
     };
@@ -98,6 +108,75 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// The pages of `[start, end)` written, asked allocation by allocation:
+/// the kernel refuses a range over several (a title buffer spans as many
+/// allocations as the runtime made for it). Parts never committed cannot
+/// have been written, so a range none of which is committed (a reserved
+/// allocation the title has not committed yet) has no writes. `None` if a
+/// committed part is not write-watched (or the range is one committed
+/// allocation, already refused); then `lost` has the pages found written
+/// before it, which the kernel no longer reports.
+fn by_allocation(
+    start: usize,
+    end: usize,
+    found: &mut Vec<usize>,
+    lost: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let query = |at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query about an address; nothing is dereferenced.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
+    while at < end {
+        let info = query(at)?;
+        let base = info.AllocationBase as usize;
+        let mut committed = info.State == MEM_COMMIT;
+        let mut to = (info.BaseAddress as usize + info.RegionSize).min(end);
+        // The rest of the allocation's regions in the range.
+        while info.State != MEM_FREE && to < end {
+            let next = query(to)?;
+            if next.State == MEM_FREE || next.AllocationBase as usize != base {
+                break;
+            }
+            committed |= next.State == MEM_COMMIT;
+            to = (next.BaseAddress as usize + next.RegionSize).min(end);
+        }
+        allocations += 1;
+        any |= committed;
+        if committed {
+            let mut count = (to - at) / KERNEL_PAGE;
+            found.resize(count.max(found.len()), 0);
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    at as *const _,
+                    to - at,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if failed {
+                // What the allocations before this one reported is cleared
+                // in the kernel now: it must still reach the journal.
+                lost.extend(pages);
+                return None;
+            }
+            pages.extend(found[..count].iter().map(|&a| a / PAGE));
+        }
+        at = to;
+    }
+    (allocations > 1 || !any).then_some(pages)
 }
 
 /// Guarded blocks of view memory.
@@ -123,12 +202,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.Type != MEM_MAPPED {
+    if !mapped(start) {
         return None;
     }
     install();
@@ -153,6 +227,52 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether the current allocation at `at` is a mapped view. Asking only for
+/// the allocation type avoids enumerating pages with identical protection,
+/// which can span an entire large view after its blocks were guarded.
+fn mapped(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_MAPPED, MEMORY_BASIC_INFORMATION, MemoryRegionInfo, QueryVirtualMemoryInformation,
+        VirtualQuery, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: both queries describe an address without dereferencing it. The
+    // output buffers match their information classes.
+    let queried = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            at as *const _,
+            MemoryRegionInfo,
+            (&raw mut region).cast(),
+            size_of_val(&region),
+            std::ptr::null_mut(),
+        )
+    };
+    if queried != 0 {
+        // These are the Windows SDK's named bitfields in declaration order.
+        // windows-sys exposes only the union's raw bits.
+        const PRIVATE: u32 = 1 << 0;
+        const MAPPED_DATA_FILE: u32 = 1 << 1;
+        const MAPPED_IMAGE: u32 = 1 << 2;
+        const MAPPED_PAGE_FILE: u32 = 1 << 3;
+        const MAPPED_PHYSICAL: u32 = 1 << 4;
+        // SAFETY: this union was filled by the successful query above.
+        match unsafe { region.Anonymous.Flags } {
+            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return true,
+            PRIVATE | MAPPED_IMAGE => return false,
+            _ => {}
+        }
+    }
+    // Unknown flag combinations and failed allocation queries keep the
+    // VirtualQuery type check, including for a free address.
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: the output buffer has the required layout and size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.Type == MEM_MAPPED
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
@@ -291,6 +411,41 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     #[test]
+    fn allocation_query_recognizes_file_views_and_rejects_nonviews() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(PAGE as u64).unwrap();
+        // SAFETY: a valid, open file and a read-only mapping of its contents.
+        let section = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: an open section containing at least one page.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        assert!(mapped(view.Value as usize + 13));
+        // SAFETY: our successful mapping and its section handle.
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(section);
+        }
+        assert!(!mapped((&raw const file) as usize)); // private stack allocation
+        assert!(!mapped(mapped as *const () as usize)); // executable image
+        assert!(!mapped(0)); // no allocation to query
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -303,6 +458,12 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        // A previous test may have used these virtual addresses.
+        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for page in start / PAGE..end / PAGE {
+            journal.written.remove(&page);
+        }
+        drop(journal);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
@@ -324,6 +485,111 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two write-watched allocations side by side (the runtime reserves
+    /// title memory allocation by allocation), asked about as one range, as
+    /// a buffer spanning them is: the pages written in each are reported.
+    #[test]
+    fn a_range_over_several_watched_allocations_is_watched() {
+        let (a, b) = loop {
+            // SAFETY: a probe reservation, released at once to find room for two.
+            let span =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!span.is_null());
+            // SAFETY: the probe above.
+            unsafe { VirtualFree(span, 0, MEM_RELEASE) };
+            let at = |p: usize| {
+                // SAFETY: a fixed address in the room just released.
+                let got = unsafe {
+                    VirtualAlloc(
+                        p as *const _,
+                        2 * PAGE,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                };
+                got as usize
+            };
+            let a = at(span as usize);
+            let b = at(span as usize + 2 * PAGE);
+            if a != 0 && b != 0 {
+                break (a, b);
+            }
+            for p in [a, b].into_iter().filter(|&p| p != 0) {
+                // SAFETY: ours.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            }
+        };
+        let _ = writes(a, b + 2 * PAGE, false);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((a + 8) as *mut u8).write(1);
+            ((b + PAGE + 8) as *mut u8).write(1);
+        }
+        let (now, found) = writes(a, b + 2 * PAGE, false).expect("watched");
+        assert_eq!(found, [(a / PAGE, now), (b / PAGE + 1, now)]);
+        // Not freed: the journal keeps these pages, and a later test given
+        // the same addresses would find them written.
+    }
+
+    /// A range in an allocation reserved but not committed yet (as the
+    /// title's are before it uses them) has no writes, and is asked again
+    /// once committed.
+    #[test]
+    fn a_range_never_committed_has_no_writes() {
+        // SAFETY: a fresh write-watched reservation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let (_, none) = writes(p, p + 2 * PAGE, false).expect("nothing can be written there");
+        assert!(none.is_empty());
+        // SAFETY: committing and writing a page of our reservation.
+        unsafe {
+            assert!(!VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            ((p + 8) as *mut u8).write(1);
+        }
+        let (now, found) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(found, [(p / PAGE, now)]);
+        // Not freed: the journal keeps these pages, and a later test given
+        // the same addresses would find them written.
+    }
+
+    /// A range over a watched allocation and one that is not: the question
+    /// is refused, and what was written in the watched one, which asking it
+    /// cleared in the kernel, is still reported to the next asker.
+    #[test]
+    fn writes_found_before_a_refusal_are_kept() {
+        let (a, b) = loop {
+            // SAFETY: a probe reservation, released at once to find room for two.
+            let span = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!span.is_null());
+            // SAFETY: the probe above.
+            unsafe { VirtualFree(span, 0, MEM_RELEASE) };
+            let at = |p: usize, watch: u32| {
+                // SAFETY: a fixed address in the room just released.
+                let got = unsafe {
+                    VirtualAlloc(p as *const _, 2 * PAGE, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE)
+                };
+                got as usize
+            };
+            let a = at(span as usize, MEM_WRITE_WATCH);
+            let b = at(span as usize + 2 * PAGE, 0);
+            if a != 0 && b != 0 {
+                break (a, b);
+            }
+            for p in [a, b].into_iter().filter(|&p| p != 0) {
+                // SAFETY: ours.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            }
+        };
+        let _ = writes(a, a + 2 * PAGE, false);
+        // SAFETY: committed pages of ours.
+        unsafe { ((a + 8) as *mut u8).write(1) };
+        assert!(writes(a, b + 2 * PAGE, false).is_none());
+        let (_, found) = writes(a, a + 2 * PAGE, false).expect("watched");
+        assert_eq!(found.iter().map(|&(p, _)| p).collect::<Vec<_>>(), [a / PAGE]);
+        // Not freed: the journal keeps these pages, and a later test given
+        // the same addresses would find them written.
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

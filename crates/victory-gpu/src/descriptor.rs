@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub use host::adjust_mips;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -431,10 +433,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -679,6 +680,17 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[test]
+    fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
+
+        create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
     #[test]

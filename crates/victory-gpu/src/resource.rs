@@ -85,17 +85,17 @@ pub(crate) struct HeapDesc {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
-    alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
-    sample_quality: u32,
-    layout: u32,
-    flags: u32,
+    pub(crate) dimension: u32,
+    pub(crate) alignment: u64,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
+    pub(crate) sample_count: u32,
+    pub(crate) sample_quality: u32,
+    pub(crate) layout: u32,
+    pub(crate) flags: u32,
 }
 
 #[repr(C)]
@@ -124,12 +124,21 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
         9..=22 => (8, 1),
         23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
         118..=120 => (3, 1),
-        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        48..=59 | 85 | 86 | 115 => (2, 1),
+        // DXGI 68/69 store two texels in each 32-bit word.
+        68..=69 => (4, 2),
         60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
         _ => return None,
     })
+}
+
+/// Packed formats 68/69 occupy a pair of texels along X and one row along Y.
+fn texture_element(format: u32) -> Option<(u64, u64, u64)> {
+    let (bytes, width) = element(format)?;
+    let height = if matches!(format, 68 | 69) { 1 } else { width };
+    Some((bytes, width, height))
 }
 
 /// A texture's layout in console memory, as the console's layout library
@@ -193,7 +202,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     let bytes = if desc.dimension == BUFFER {
         desc.width
     } else {
-        let (element, block) = element(desc.format)?;
+        let (element, block_width, block_height) = texture_element(desc.format)?;
         let (depth, slices) = if desc.dimension == TEXTURE_3D {
             (u64::from(desc.depth_or_array_size), 1)
         } else {
@@ -203,8 +212,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         let mips = mip_count(desc);
         let mut chain = 0u64;
         for mip in 0..mips.min(64) {
-            let w = (desc.width >> mip).max(1).div_ceil(block);
-            let h = (height >> mip).max(1).div_ceil(block);
+            let w = (desc.width >> mip).max(1).div_ceil(block_width);
+            let h = (height >> mip).max(1).div_ceil(block_height);
             let d = (depth >> mip).max(1);
             chain = chain.checked_add(w.checked_mul(h)?.checked_mul(d)?.checked_mul(element)?)?;
         }
@@ -324,11 +333,24 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A subresource index packed into the footprint offset slot for `CopyLocation`.
+    #[cfg(windows)]
+    pub(crate) const fn subresource(index: u32) -> Self {
+        Self {
+            offset: index as u64,
+            format: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
+        let (element, block_width, block_height) = texture_element(self.format)?;
+        let lines = u64::from(self.height).div_ceil(block_height) * u64::from(self.depth);
+        let last = u64::from(self.width).div_ceil(block_width) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 }
@@ -368,17 +390,17 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     if slice >= slices {
         return None;
     }
-    let (element, block) = element(desc.format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
+    let (element, block_width, block_height) = texture_element(desc.format)?;
+    let width = (desc.width >> mip).max(1).next_multiple_of(block_width);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
-        .next_multiple_of(block);
+        .next_multiple_of(block_height);
     let depth = if desc.dimension == TEXTURE_3D {
         (u32::from(desc.depth_or_array_size) >> mip).max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = width / block_width * element;
     let footprint = PlacedFootprint {
         offset: 0,
         format: desc.format,
@@ -387,12 +409,13 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         depth,
         row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((footprint, u32::try_from(height / block_height).ok()?, row_size))
 }
 
-/// Device method: where each subresource goes in an upload buffer, rows
-/// 256-byte and subresources 512-byte aligned, as on PC. Unknown sizes give
-/// the documented all-ones values.
+/// Device method: where each subresource goes in an upload buffer. Rows
+/// have 256-byte pitches and subsequent subresources are 512-byte aligned
+/// relative to the supplied base offset, as on PC. Unknown sizes give the
+/// documented all-ones values.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
@@ -407,16 +430,31 @@ pub(crate) extern "system" fn copyable_footprints(
     const PLACEMENT: u64 = 512;
     // SAFETY: the title passes a description (null is tolerated).
     let desc = unsafe { desc.as_ref() };
-    let mut end = base;
+    // Keep offsets relative to `base`: D3D12 preserves an unaligned base
+    // and aligns the distance to each following subresource.
+    let mut end = 0u64;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one = desc
+            .and_then(|d| first.checked_add(i).and_then(|index| subresource(d, index)))
+            .and_then(|(mut footprint, row_count, row_size)| {
+                let offset = base.checked_add(end)?;
+                let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+                let preceding_rows = u64::from(footprint.row_pitch)
+                    .checked_mul(lines.saturating_sub(1))?;
+                let span = preceding_rows.checked_add(row_size)?;
+                let next = end.checked_add(span)?;
+                let next = if i + 1 < count {
+                    next.checked_next_multiple_of(PLACEMENT)?
+                } else {
+                    next
+                };
+                footprint.offset = offset;
+                Some((footprint, row_count, row_size, next))
+            });
         let (layout, row_count, row_size) = match one {
-            Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
+            Some((footprint, row_count, row_size, next)) => {
+                end = next;
                 (footprint, row_count, row_size)
             }
             None => {
@@ -443,7 +481,7 @@ pub(crate) extern "system" fn copyable_footprints(
     }
     if !total.is_null() {
         // SAFETY: checked non-null.
-        unsafe { total.write(if known { end - base } else { u64::MAX }) };
+        unsafe { total.write(if known { end } else { u64::MAX }) };
     }
 }
 
@@ -746,9 +784,39 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. Made on first use (a view, a target, a copy, a barrier), not
+    /// at creation: a texture the title makes and never has the GPU use
+    /// costs no host memory (the world makes thousands; their host copies
+    /// took about 9 GB, past an 8 GB card's budget, 2026-11-24).
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    /// The creation state and clear value the host copy is made with.
+    #[cfg(windows)]
+    made_with: (u32, Option<[u32; 5]>),
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// The host copy, made now if this is its first use.
+    fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host
+            .get_or_init(|| {
+                let (state, clear) = self.made_with;
+                let clear = clear
+                    .as_ref()
+                    .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+                let (texture, drop) = host_texture(&self.desc, state, clear)?;
+                let state =
+                    crate::host::legal_state(&texture, crate::host::texture_state(state));
+                Some(std::sync::Arc::new(HostTexture {
+                    texture,
+                    state: state.into(),
+                    title_mips: self.desc.mip_levels,
+                    mip_drop: drop as u16,
+                }))
+            })
+            .as_ref()
+    }
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -757,10 +825,47 @@ struct Resource {
 /// may release a resource whose commands it recorded but not yet submitted
 /// (console memory outlives the object; a host texture must outlive the
 /// lists that name it).
+/// Maps a guest subresource index to the corresponding host subresource index,
+/// or `None` if the subresource was dropped.
+pub fn map_subresource(guest_sub: u32, guest_mips: u32, drop: u32) -> Option<u32> {
+    if drop == 0 || guest_mips == 0 {
+        return Some(guest_sub);
+    }
+    let slice = guest_sub / guest_mips;
+    let guest_mip = guest_sub % guest_mips;
+    if guest_mip < drop {
+        return None;
+    }
+    let host_mips = guest_mips.saturating_sub(drop).max(1);
+    let host_mip = guest_mip - drop;
+    Some(slice * host_mips + host_mip)
+}
+
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) title_mips: u16,
+    pub(crate) mip_drop: u16,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    pub(crate) fn host_mips(&self) -> u32 {
+        u32::from(self.title_mips)
+            .saturating_sub(u32::from(self.mip_drop))
+            .max(1)
+    }
+
+    /// Maps a guest subresource index to the corresponding host subresource index,
+    /// or `None` if the subresource was dropped.
+    pub(crate) fn host_subresource(&self, guest_sub: u32) -> Option<u32> {
+        map_subresource(
+            guest_sub,
+            u32::from(self.title_mips),
+            u32::from(self.mip_drop),
+        )
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -768,7 +873,7 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -783,7 +888,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -792,17 +897,81 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host().cloned()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
+/// Computes the number of mips to drop for this texture under the current
+/// mip drop setting. Pure sampled textures with sufficient mips and size
+/// are scaled down to reduce VRAM consumption on low-VRAM GPUs.
+#[cfg(windows)]
+pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
+    let drop = crate::texture::texture_mip_drop();
+    if drop == 0 {
+        return 0;
+    }
+    let min_size = crate::texture::texture_mip_drop_min_size();
+    compute_mip_drop_explicit(desc, drop, min_size)
+}
+
+pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    if drop == 0 {
+        return 0;
+    }
+    // Only drop for pure sampled textures: not buffers, not render targets,
+    // not depth buffers, not UAVs, not 3D textures, and not textures with MSAA.
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    if desc.dimension == BUFFER
+        || desc.dimension == TEXTURE_3D
+        || desc.flags & TARGET_DEPTH_UNORDERED != 0
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    // Exclude non-power-of-two (NPOT) textures: display artwork, loading screens,
+    // video frames, and UI presentation surfaces (e.g. 1920x1080, 1280x720, 2560x1440).
+    // These are 2D presentation assets whose titles copy only subresource 0;
+    // dropping them causes flat-colour loading screens while saving negligible VRAM (<10 MB).
+    // In contrast, 3D world streaming textures in RAGE are strictly power-of-two.
+    if !desc.width.is_power_of_two() || !desc.height.is_power_of_two() {
+        return 0;
+    }
+    // Size floor: drop only textures where both dimensions are at least `min_size`
+    // (default 1024). Small utility textures account for < 2.5% of VRAM but cause
+    // copy coordinate underflow and 1x1 degenerate collapses. Testers can configure
+    // this via VICTORY_TEXTURE_MIP_DROP_MIN_SIZE (e.g. 2048 for conservative mode).
+    if desc.width < min_size || u64::from(desc.height) < min_size {
+        return 0;
+    }
+    let block = element(pc_format(desc.format)).map_or(1, |(_, b)| b);
+    let mut k = drop;
+    while k > 0 {
+        let w = desc.width >> k;
+        let h = u64::from(desc.height) >> k;
+        // Require at least 2 mips to survive on the host and preserve BCn block alignment.
+        if desc.mip_levels > (k as u16 + 1)
+            && w > 0
+            && h > 0
+            && (block <= 1
+                || (w >= block
+                    && h >= block
+                    && w.is_multiple_of(block)
+                    && h.is_multiple_of(block)))
+        {
+            return k;
+        }
+        k -= 1;
+    }
+    0
+}
+
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -813,6 +982,15 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    let drop = compute_mip_drop(desc);
+    if drop > 0 {
+        d.width = (d.width >> drop).max(1);
+        d.height = (d.height >> drop).max(1);
+        if d.dimension == TEXTURE_3D {
+            d.depth_or_array_size = (d.depth_or_array_size >> drop).max(1);
+        }
+        d.mip_levels -= drop as u16;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
@@ -847,30 +1025,69 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+        // A clear value is only legal on render targets and depth.
+        let clear = clear_value
+            .as_ref()
+            .filter(|_| d.flags & (1 | DEPTH) != 0)
+            .map(|v| std::ptr::from_ref(v).cast());
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(
+                    d.flags,
+                    crate::host::texture_state(state),
+                ) as i32),
+                // The same layout: format, then color or depth and stencil.
+                clear,
+                texture,
+            )
+        }
     };
+    let mut made = create(&d, &mut texture);
+    // Not every host GPU offers every use of every format (NVIDIA: no
+    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
+    // console's AMD GPU has both). Give up the uses the host refuses, UAV
+    // first; the views the host cannot make are skipped as for depth.
+    for drop in [UNORDERED, 1] {
+        if made.is_ok() || d.flags & drop == 0 {
+            continue;
+        }
+        let mut fewer = d;
+        fewer.flags &= !drop;
+        let mut retry: Option<ID3D12Resource> = None;
+        if create(&fewer, &mut retry).is_ok() {
+            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
+            d = fewer;
+            texture = retry;
+            made = Ok(());
+        } else if drop == UNORDERED {
+            d = fewer; // also try with neither
+        }
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            if drop > 0 {
+                format!(
+                    "texture {}x{} f{} flags {:#x} (dropped {drop} mips from {}x{})",
+                    d.width, d.height, d.format, d.flags, desc.width, desc.height
+                )
+            } else {
+                format!(
+                    "texture {}x{} f{} flags {:#x}",
+                    d.width, d.height, d.format, d.flags
+                )
+            }
         });
     }
-    texture
+    texture.map(|t| (t, drop))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -927,8 +1144,13 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // The clear value is the caller's only during the call.
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let made_with = (
+        state,
+        // SAFETY: the title passes a whole clear value (5 words) or null.
+        (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
+    );
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -936,13 +1158,9 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        made_with,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -958,7 +1176,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -972,6 +1191,10 @@ impl Drop for Resource {
                     "a title texture was released while a list not yet reset names its host copy"
                 );
             }
+        }
+        // A running submission may still read the host copy.
+        if let Some(host) = self.host.take().flatten() {
+            crate::host::retire(host);
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1174,7 +1397,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1247,9 +1470,17 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
-    if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+    // SAFETY: `out` is null or points to room for a description, which the
+    // title provides for GetDesc.
+    if let Some(out) = unsafe { out.as_mut() } {
+        let mut desc = resource(this).desc;
+        // Native D3D12 reports the levels it actually allocated for an
+        // automatically sized chain; keep the title's explicit value
+        // otherwise.
+        if desc.mip_levels == 0 {
+            desc.mip_levels = mip_count(&desc) as u16;
+        }
+        *out = desc;
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -1407,6 +1638,66 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    fn mip_drop_computation_respects_constraints() {
+        let sample_tex = texture(1024, 1024, 28, 10);
+        assert_eq!(sample_tex.flags, 0);
+
+        // When drop is 0:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 0, 1024), 0);
+
+        // Render targets and depth buffers should never drop mips:
+        let mut rt_tex = sample_tex;
+        rt_tex.flags = 1; // RENDER_TARGET
+        assert_eq!(compute_mip_drop_explicit(&rt_tex, 1, 1024), 0);
+
+        let mut depth_tex = sample_tex;
+        depth_tex.flags = 2; // DEPTH
+        assert_eq!(compute_mip_drop_explicit(&depth_tex, 1, 1024), 0);
+
+        let mut uav_tex = sample_tex;
+        uav_tex.flags = 4; // UNORDERED
+        assert_eq!(compute_mip_drop_explicit(&uav_tex, 1, 1024), 0);
+
+        // Textures with 1 mip should never drop:
+        let mut single_mip = sample_tex;
+        single_mip.mip_levels = 1;
+        assert_eq!(compute_mip_drop_explicit(&single_mip, 1, 1024), 0);
+
+        // Buffer should never drop:
+        let buf = buffer(1024);
+        assert_eq!(compute_mip_drop_explicit(&buf, 1, 1024), 0);
+
+        // Non-power-of-two textures (loading artwork, UI e.g. 1920x1080, 1280x720) must never drop:
+        let loading_art = texture(1920, 1080, 28, 11);
+        assert_eq!(compute_mip_drop_explicit(&loading_art, 1, 1024), 0);
+        let ui_art = texture(1280, 720, 28, 10);
+        assert_eq!(compute_mip_drop_explicit(&ui_art, 1, 1024), 0);
+
+        // Standard POT 3D textures >= 1024 drop properly:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 1024), 1);
+        let large_tex = texture(2048, 2048, 28, 12);
+        assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 1024), 1);
+        let non_square_pot = texture(2048, 1024, 28, 11);
+        assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 1024), 1);
+
+        // Textures under min_size floor (e.g. 512x512) are preserved:
+        let small_tex = texture(512, 512, 28, 9);
+        assert_eq!(compute_mip_drop_explicit(&small_tex, 1, 1024), 0);
+
+        // Conservative min_size = 2048 preserves 1024 textures and drops >= 2048:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 2048), 0);
+        assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 2048), 0);
+        assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 2048), 1);
+
+        // BCn block alignment: BC7 (format 98, 4x4 blocks) at 16x16 with custom min_size=4
+        // must clamp drop from 3 to 2 so mip 0 stays >= 4x4 and block-aligned.
+        let small_bc7 = texture(16, 16, 98, 5);
+        assert_eq!(compute_mip_drop_explicit(&small_bc7, 3, 4), 2);
+        let tiny_bc7 = texture(4, 4, 98, 3);
+        assert_eq!(compute_mip_drop_explicit(&tiny_bc7, 1, 4), 0);
     }
 
     #[test]
@@ -1583,6 +1874,52 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn copyable_footprints_match_native_packed_and_unaligned_cases() {
+        // DXGI 68/69 store pairs of texels in one 32-bit word. An odd mip
+        // width of five therefore occupies three words (six footprint texels).
+        for format in [68, 69] {
+            let desc = texture(10, 6, format, 2);
+            let (mut layout, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT], [0u32], [0u64], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                1,
+                1,
+                0,
+                layout.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!((layout[0].width, layout[0].height), (6, 3), "format {format}");
+            assert_eq!((rows[0], sizes[0]), (3, 12), "format {format}");
+            assert_eq!(layout[0].row_pitch, 256, "format {format}");
+            assert_eq!(total, 524, "format {format}");
+        }
+
+        let desc = texture(10, 6, 28, 2);
+        for base in [0, 1] {
+            let (mut layouts, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT; 2], [0u32; 2], [0u64; 2], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                2,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(layouts[0].offset, base);
+            assert_eq!(layouts[1].offset, base + 1536);
+            assert_eq!(total, 2068);
+        }
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
@@ -1840,5 +2177,74 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn get_desc_reports_the_allocated_mip_chain() {
+        type Desc = extern "system" fn(This, *mut ResourceDesc);
+        let null = std::ptr::null();
+        let create = |desc: &ResourceDesc, out: &mut This| {
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    out,
+                ),
+                S_OK
+            );
+        };
+        let reported = |this: This| {
+            let mut desc = buffer(0);
+            slot::<Desc>(this, 0x50)(this, &mut desc);
+            desc.mip_levels
+        };
+
+        let mut automatic = null;
+        create(&texture(4, 4, 28, 0), &mut automatic);
+        assert_eq!(reported(automatic), 3, "4x4 has three levels");
+        assert_eq!(slot::<Release>(automatic, 0x10)(automatic), 0);
+
+        let mut explicit = null;
+        create(&texture(16, 16, 28, 2), &mut explicit);
+        assert_eq!(reported(explicit), 2, "explicit count is preserved");
+        assert_eq!(slot::<Release>(explicit, 0x10)(explicit), 0);
+
+        let mut buf = null;
+        create(&buffer(256), &mut buf);
+        assert_eq!(reported(buf), 1, "buffers have one level");
+        assert_eq!(slot::<Release>(buf, 0x10)(buf), 0);
+    }
+
+    /// Subresource index remapping prunes dropped guest mips and correctly maps surviving mips.
+    #[test]
+    fn subresource_index_remapping_and_pruning() {
+        // 6 slices (e.g. Cubemap), 8 guest mips, drop 2 -> host has 6 mips
+        const GUEST_MIPS: u32 = 8;
+        const DROP: u32 = 2;
+
+        // Slice 0, guest mip 0 -> dropped
+        assert_eq!(map_subresource(0, GUEST_MIPS, DROP), None);
+        // Slice 0, guest mip 1 -> dropped
+        assert_eq!(map_subresource(1, GUEST_MIPS, DROP), None);
+        // Slice 0, guest mip 2 -> host slice 0, mip 0 = 0
+        assert_eq!(map_subresource(2, GUEST_MIPS, DROP), Some(0));
+        // Slice 0, guest mip 7 -> host slice 0, mip 5 = 5
+        assert_eq!(map_subresource(7, GUEST_MIPS, DROP), Some(5));
+
+        // Slice 1, guest mip 0 (subresource 8) -> dropped
+        assert_eq!(map_subresource(8, GUEST_MIPS, DROP), None);
+        // Slice 1, guest mip 2 (subresource 10) -> host slice 1, mip 0 = 6
+        assert_eq!(map_subresource(10, GUEST_MIPS, DROP), Some(6));
+
+        // Slice 3, guest mip 4 (subresource 3 * 8 + 4 = 28) -> host slice 3, mip 2 (3 * 6 + 2 = 20)
+        assert_eq!(map_subresource(28, GUEST_MIPS, DROP), Some(20));
+
+        // Zero drop -> pass through
+        assert_eq!(map_subresource(15, GUEST_MIPS, 0), Some(15));
     }
 }
